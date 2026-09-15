@@ -1,0 +1,4 @@
+# orchestration/allow.txt — extra permission rules for EVERY worker in this project, one per line.
+# Role-specific: allow.build.txt / allow.explore.txt. Example:
+# Bash(.venv/bin/pytest:*)
+# Bash(.venv/bin/python:*)

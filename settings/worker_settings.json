@@ -1,0 +1,56 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf:*)",
+      "Bash(rm -r:*)",
+      "Bash(sudo:*)",
+      "Bash(su:*)",
+      "Bash(git push:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(git rebase:*)",
+      "Bash(git branch -D:*)",
+      "Bash(git checkout -- :*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)",
+      "Bash(killall:*)",
+      "Bash(shutdown:*)",
+      "Bash(reboot:*)",
+      "Bash(claude:*)",
+      "Edit(~/.claude/**)",
+      "Write(~/.claude/**)",
+      "Edit(orchestration/plan.md)",
+      "Write(orchestration/plan.md)",
+      "Edit(orchestration/progress.md)",
+      "Write(orchestration/progress.md)",
+      "Edit(orchestration/friction.md)",
+      "Write(orchestration/friction.md)",
+      "Edit(orchestration/questions.md)",
+      "Write(orchestration/questions.md)",
+      "Edit(orchestration/handoff.md)",
+      "Write(orchestration/handoff.md)"
+    ]
+  },
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "date -u +%Y-%m-%dT%H:%M:%SZ > \"$ORCH_WORKER_DIR/ended\""
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"import json,sys,os,time; d=json.load(sys.stdin); open(os.path.join(os.environ.get('ORCH_WORKER_DIR','.'),'stop_failure'),'a').write(json.dumps({'t':time.time(),'error_type':d.get('error_type')})+'\\n')\""
+          }
+        ]
+      }
+    ]
+  }
+}

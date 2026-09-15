@@ -1,0 +1,6 @@
+# Example orchestration/allow.txt for a Python project with a virtualenv.
+# One rule per line. Copy to <project>/orchestration/allow.txt and edit.
+Bash(.venv/bin/pytest:*)
+Bash(.venv/bin/python:*)
+Bash(.venv/bin/pip show:*)
+Bash(.venv/bin/pip list:*)

@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Claude Code statusline command for the orchestration toolkit.
+
+Reads the statusline JSON on stdin, records usage limits and per-session context usage to
+~/.claude/orch/ so `orch limits` / `orch brief` can read them, and prints a one-line status.
+Never fails loudly: a broken statusline must not disturb the session.
+"""
+import json, os, sys, time, datetime
+
+BASE = os.path.expanduser(os.environ.get("ORCH_STATE_DIR", "~/.claude/orch"))
+
+def main():
+    try:
+        j = json.load(sys.stdin)
+    except Exception:
+        print("orch: no statusline data"); return
+    now = time.time()
+    rl = j.get("rate_limits") or {}
+    cw = j.get("context_window") or {}
+    model = (j.get("model") or {}).get("display_name") or (j.get("model") or {}).get("id") or "?"
+    sid = j.get("session_id") or "unknown"
+    cwd = j.get("cwd") or (j.get("workspace") or {}).get("current_dir") or ""
+    try:
+        os.makedirs(os.path.join(BASE, "sessions"), exist_ok=True)
+        if rl:
+            tmp = os.path.join(BASE, "limits.json.tmp")
+            with open(tmp, "w") as f:
+                json.dump({"rate_limits": rl, "_written_at": now, "_session_id": sid}, f)
+            os.replace(tmp, os.path.join(BASE, "limits.json"))
+        with open(os.path.join(BASE, "sessions", f"{sid}.json"), "w") as f:
+            json.dump({"session_id": sid, "cwd": cwd, "model": model, "context_window": cw, "_written_at": now}, f)
+    except Exception:
+        pass
+
+    def win(name, label):
+        w = rl.get(name) or {}
+        if not w: return None
+        used = w.get("used_percentage"); ra = w.get("resets_at")
+        s = f"{label} {used:.0f}%" if isinstance(used, (int, float)) else f"{label} ?"
+        try:
+            ts = float(ra) if not isinstance(ra, str) else datetime.datetime.fromisoformat(ra.replace("Z", "+00:00")).timestamp()
+            s += f"→{datetime.datetime.fromtimestamp(ts).strftime('%H:%M')}"
+        except Exception:
+            pass
+        return s
+    parts = [model]
+    if isinstance(cw.get("used_percentage"), (int, float)):
+        parts.append(f"ctx {cw['used_percentage']:.0f}%")
+    for name, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        p = win(name, label)
+        if p: parts.append(p)
+    print(" | ".join(parts))
+
+if __name__ == "__main__":
+    main()
