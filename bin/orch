@@ -22,8 +22,8 @@ usage:
   orch status  --project <dir>
   orch report  --project <dir>          run analytics per phase: cost, turns, turn-cap rate, limit hits, denials by shape (markdown)
   orch brief   --project <dir>          compact start-of-session briefing for a manager
-  orch limits                           current 5h/7d usage as last seen by the statusline (exit 2 if 5h >= 85%)
-  orch context --project <dir>          context usage of the newest interactive session in <dir> (exit 2 if >= 60%)
+  orch limits [--refresh]               5h/7d usage from the last worker run or statusline; --refresh runs a 1-turn haiku probe (exit 2 if 5h >= 85%)
+  orch context --project <dir>          context % (terminal statusline) or compaction count (IDE extension) of the newest session in <dir>
   orch ended   --project <dir> --id <id>  (used by the SessionEnd hook)
 
 spawn blocks until the worker exits. Run it in the background from the manager so the
@@ -37,7 +37,7 @@ USAGE
 [ $# -ge 1 ] || usage
 CMD="$1"; shift
 
-PROJECT=""; ID=""; ROLE=""; MODEL=""; MANAGER=""; PROMPT_FILE=""; MAX_TURNS=""; RESUME=0; NOTE=""
+PROJECT=""; ID=""; ROLE=""; MODEL=""; MANAGER=""; PROMPT_FILE=""; MAX_TURNS=""; RESUME=0; NOTE=""; REFRESH=0
 EXTRA_ALLOW=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -51,6 +51,7 @@ while [ $# -gt 0 ]; do
     --allow) EXTRA_ALLOW+=("$2"); shift 2;;
     --resume) RESUME=1; shift;;
     --note) NOTE="$2"; shift 2;;
+    --refresh) REFRESH=1; shift;;
     -h|--help) usage;;
     *) echo "unknown arg: $1" >&2; usage;;
   esac
@@ -66,6 +67,34 @@ fi
 read_allow_file() { # $1 file -> prints non-comment, non-empty lines
   [ -f "$1" ] || return 0
   grep -vE '^\s*(#|$)' "$1" || true
+}
+
+# Turn a stream-json capture into run.json (the final result message) and record any rate_limit_event.
+harvest_stream() { # $1 stream.jsonl  $2 run.json  $3 source-label
+  python3 - "$1" "$2" "$3" "$LIMITS_FILE" <<'PY'
+import json,sys,os,time
+stream,run,src,limits=sys.argv[1:5]
+result=None; rl=None
+for line in open(stream,errors='replace'):
+    line=line.strip()
+    if not line: continue
+    try: j=json.loads(line)
+    except Exception: continue
+    if j.get('type')=='result': result=j
+    elif j.get('type')=='rate_limit_event': rl=j.get('rate_limit_info') or rl
+if result is not None:
+    json.dump(result,open(run,'w'))
+else:
+    open(run,'w').write('')   # keeps "empty run.json" semantics for classify_run
+if rl and rl.get('unifiedWindows'):
+    w=rl['unifiedWindows']; out={'rate_limits':{}}
+    for k in ('five_hour','seven_day'):
+        if k in w and w[k] is not None:
+            out['rate_limits'][k]={'used_percentage':round(100*float(w[k].get('utilization',0)),1),'resets_at':w[k].get('resetsAt')}
+    out.update({'_written_at':time.time(),'_source':src,'status':rl.get('status'),'overage':rl.get('overageStatus')})
+    os.makedirs(os.path.dirname(limits),exist_ok=True)
+    tmp=limits+'.tmp'; json.dump(out,open(tmp,'w')); os.replace(tmp,limits)
+PY
 }
 
 # Classify a finished run. Prints: OUTCOME<TAB>detail
@@ -139,8 +168,17 @@ PY
 }
 
 cmd_limits() {
+  if [ "$REFRESH" = 1 ]; then
+    # One-turn haiku probe (~1 cent). Its stream carries a rate_limit_event with current utilisation.
+    PD="$(mktemp -d)"
+    ( cd "$PD" && "$CLAUDE_BIN" -p --model haiku --max-turns 1 --output-format stream-json --verbose \
+        --permission-mode dontAsk --permission-prompts none --name orch-limits-probe \
+        <<< "Reply with the single word: ok" > "$PD/stream.jsonl" 2> "$PD/err.log" ) || true
+    harvest_stream "$PD/stream.jsonl" "$PD/run.json" probe
+    rm -rf "$PD"
+  fi
   if [ ! -f "$LIMITS_FILE" ]; then
-    echo "no limits data yet ($LIMITS_FILE). Run install.sh, then open a new interactive Claude Code session so the statusline reports."; exit 3
+    echo "no limits data yet. Run: orch limits --refresh   (any worker run also records it)"; exit 3
   fi
   python3 - "$LIMITS_FILE" <<'PY'
 import json,sys,time,datetime
@@ -157,7 +195,8 @@ def fmt(name):
             mins=int((ts-time.time())//60); when=f" resets_in={mins}m ({datetime.datetime.fromtimestamp(ts).strftime('%H:%M')})"
         except Exception: when=f" resets_at={ra}"
     return f"{name}: used={used}%{when}"
-print(f"as_of={age}s ago  " + "  ".join(fmt(n) for n in ('five_hour','seven_day')))
+stale=" (STALE: run 'orch limits --refresh')" if age>1800 else ""
+print(f"as_of={age//60}m ago via {j.get('_source','statusline')}{stale}  " + "  ".join(fmt(n) for n in ('five_hour','seven_day')))
 if rl.get('five_hour',{}).get('used_percentage',0) is not None and rl.get('five_hour',{}).get('used_percentage',0)>=85: sys.exit(2)
 PY
 }
@@ -232,10 +271,28 @@ for f in glob.glob(os.path.join(d,'*.json')):
     except Exception: continue
     if os.path.realpath(j.get('cwd') or '')!=os.path.realpath(proj): continue
     if not best or j.get('_written_at',0)>best.get('_written_at',0): best=j
-if not best: print("context: n/a (no interactive session in this dir has reported yet)"); sys.exit(0)
-cw=best.get('context_window') or {}; used=cw.get('used_percentage'); age=int(time.time()-best.get('_written_at',0))
-print(f"context: used={used}% model={best.get('model')} session={best.get('session_id')} as_of={age}s ago")
-if isinstance(used,(int,float)) and used>=60: sys.exit(2)
+# compaction markers written by the PreCompact hook (works in the IDE extension, where no statusline runs)
+comp=[]
+for f in glob.glob(os.path.join(d,'*.compact.log')):
+    try:
+        for line in open(f):
+            e=json.loads(line)
+            if os.path.realpath(e.get('cwd') or '')==os.path.realpath(proj): comp.append(e)
+    except Exception: pass
+comp.sort(key=lambda e:e.get('t',0))
+recent=[e for e in comp if time.time()-e.get('t',0)<24*3600]
+by_sess={}
+for e in recent: by_sess[e.get('session_id')]=by_sess.get(e.get('session_id'),0)+1
+if best:
+    cw=best.get('context_window') or {}; used=cw.get('used_percentage'); age=int(time.time()-best.get('_written_at',0))
+    print(f"context: used={used}% model={best.get('model')} session={best.get('session_id')} as_of={age//60}m ago (statusline)")
+    if isinstance(used,(int,float)) and used>=60: sys.exit(2)
+elif recent:
+    last=recent[-1]; n=by_sess.get(last.get('session_id'),0)
+    print(f"context: no statusline (IDE extension?). Session {last.get('session_id')} has compacted {n}x in 24h, last {int(time.time()-last['t'])//60}m ago. Rule: 1 compaction = finish the phase then hand over; 2 = hand over now.")
+    if n>=1: sys.exit(2)
+else:
+    print("context: n/a — no statusline report and no compaction yet for a session in this dir (IDE extension sessions report only via the PreCompact hook)")
 PY
 }
 
@@ -290,6 +347,7 @@ cmd_spawn() {
     SID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["session_id"])' "$WDIR/run.json")"
     TS=$(date +%s)
     mv "$WDIR/run.json" "$WDIR/run.$TS.json"
+    [ -f "$WDIR/stream.jsonl" ] && mv "$WDIR/stream.jsonl" "$WDIR/stream.$TS.jsonl"
     [ -f "$WDIR/result.md" ] && mv "$WDIR/result.md" "$WDIR/result.$TS.md"
     rm -f "$WDIR/ended"
     RESUME_ARGS=(--resume "$SID")
@@ -316,15 +374,17 @@ cmd_spawn() {
   ( cd "$PROJECT" && ORCH_WORKER_DIR="$WDIR" ORCH_TOOLKIT="$TOOLKIT" \
     "$CLAUDE_BIN" -p \
       --model "$MODEL" --name "worker-$ID" \
-      --output-format json --permission-mode dontAsk --permission-prompts none \
+      --output-format stream-json --verbose --permission-mode dontAsk --permission-prompts none \
       --max-turns "$MAX_TURNS" \
       --settings "$TOOLKIT/settings/worker_settings.json" \
       --append-system-prompt-file "$WDIR/.system_prompt.md" \
       --allowedTools "${ALLOW[@]}" \
       "${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"}" \
-      <<< "$PROMPT" > "$WDIR/run.json" 2> "$WDIR/stderr.log" )
+      <<< "$PROMPT" > "$WDIR/stream.jsonl" 2> "$WDIR/stderr.log" )
   RC=$?
   set -e
+  # stream.jsonl holds every message; run.json gets the final result; any rate_limit_event refreshes orch limits.
+  harvest_stream "$WDIR/stream.jsonl" "$WDIR/run.json" "worker-$ID"
 
   CLS="$(classify_run "$WDIR/run.json" "$WDIR/result.md")"
   OUTCOME="${CLS%%	*}"; DETAIL="${CLS#*	}"

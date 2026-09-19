@@ -23,7 +23,7 @@ git clone https://github.com/Adityaram0001/claude-orch
 cd claude-orch && ./install.sh
 ```
 
-This symlinks `orch` and `orch-statusline` into `~/.local/bin`, the skills into `~/.claude/skills/`, and, only if you have none configured, sets your Claude Code statusline to `orch-statusline` so usage limits and context percentage can be read by `orch limits` / `orch brief`. Open a new Claude Code session afterwards so the statusline starts reporting.
+This symlinks `orch` and `orch-statusline` into `~/.local/bin` and the skills into `~/.claude/skills/`. It also edits `~/.claude/settings.json` in two small ways: sets the statusline to `orch-statusline` if you have none configured (terminal sessions then report usage limits and context percentage), and adds a `PreCompact` hook that records compactions so `orch context` works inside IDE extensions. Both are additive; nothing existing is overwritten.
 
 ## Quick start
 
@@ -84,7 +84,11 @@ Every worker gets `templates/worker_protocol.md` as an appended system prompt. I
 
 ### Usage limits and context
 
-`orch-statusline` records the 5-hour / 7-day usage percentages, reset times and the session's context percentage that Claude Code passes to statusline commands. `orch limits` and `orch context --project .` read them. The manager skill uses them: below 70% used it spawns freely; at 85% or on any `RATE_LIMITED` outcome it stops spawning, writes the handoff, and either schedules its own wake-up after the reset (if its context is still small) or asks you to start a fresh manager after the reset. At 60% context it stops starting new phases; at 75% it hands over.
+Every worker run emits a `rate_limit_event` with the account's 5-hour and 7-day utilisation and reset times; `orch spawn` records it, so `orch limits` is refreshed for free whenever a worker exits. `orch limits --refresh` runs a one-turn Haiku probe (about a cent, a few seconds) when nothing has run recently. In terminal sessions the installed statusline records the same numbers plus the session's context percentage.
+
+The manager skill uses them: below 70% used it spawns freely; at 85% or on any `RATE_LIMITED` outcome it stops spawning, writes the handoff, and either schedules its own wake-up after the reset (if its context is still small) or asks you to start a fresh manager after the reset.
+
+For the manager's own context, `orch context --project .` reports the statusline's context percentage in terminal sessions (hand over at 60–75%). Inside the VS Code / JetBrains extension the statusline never runs, so a PreCompact hook records each compaction instead and the rule becomes: one compaction, finish the phase then hand over; two, hand over now.
 
 ### State files (all markdown, in `orchestration/`)
 
@@ -110,8 +114,8 @@ orch spawn   --project <dir> --id <id> --role explore|build --model <m> --manage
 orch status  --project <dir>
 orch brief   --project <dir>      # limits, context, workers, open questions, handoff — one read
 orch report  --project <dir>      # per-phase cost, turns, turn-cap rate, limit hits, denials by shape
-orch limits                       # 5h / 7d usage as last reported by the statusline
-orch context --project <dir>      # context % of the newest interactive session in that directory
+orch limits [--refresh]           # 5h / 7d usage from the last worker run, the statusline, or a 1-turn probe
+orch context --project <dir>      # context % (terminal) or compaction count (IDE extension) of the newest session there
 ```
 
 Skills: `/orch-manager [resume]`, `/orch-status`, `/orch-new-skill <name> — <purpose>`.

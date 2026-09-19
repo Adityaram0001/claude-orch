@@ -28,9 +28,15 @@ Workers run with `--permission-mode dontAsk --permission-prompts none`, so nothi
 
 Measured on a 12-command matrix (Claude Code 2.1.270): pipes, chains and redirects are allowed when every part matches an allow rule; environment-variable prefixes, shell loops, `git -C` and any chain containing one unallowed command are denied as a whole; the glob rule form `Bash(bash some/dir/*)` matches a script path, the prefix form `Bash(bash some/dir/:*)` does not.
 
-## 6. Usage limits are read from the statusline
+## 6. Usage limits come from the workers' own streams
 
-Claude Code passes `rate_limits.five_hour / seven_day {used_percentage, resets_at}` and `context_window.used_percentage` to statusline commands and nowhere else that a script can read (`/usage` is display-only). `orch-statusline` records them to `~/.claude/orch/`. Headless workers that hit the window die with HTTP 429 and the text "You've hit your session limit · resets HH:MM"; `orch spawn` classifies that as `RATE_LIMITED` and prints the reset time. Interactive sessions on 2.1.234+ auto-continue at the reset if a limit interrupts them mid-turn; the manager relies on that for itself, never for workers.
+In `--output-format stream-json` every run emits a `rate_limit_event` whose `unifiedWindows` carry `five_hour` / `seven_day` `{utilization, resetsAt}`. Workers therefore run in stream mode; `orch spawn` keeps the full stream in the worker's directory, extracts the final `result` message into `run.json`, and records the latest limit event to `~/.claude/orch/limits.json`. Nothing has to be polled: every worker exit refreshes the numbers. `orch limits --refresh` runs a one-turn Haiku probe for the same event when no worker has run recently.
+
+Caveat: `rate_limit_event` is observed behaviour (Claude Code 2.1.270), not a documented message type; the documented stream events carry token usage only. If a future version stops emitting it, `orch limits` degrades to the statusline source (terminal sessions; set `statusLine.refreshInterval` for periodic updates) and reports STALE rather than guessing.
+
+The statusline is a second source in terminal sessions and the only source of the manager's own context percentage; IDE extensions never run it (verified: four days of an extension session wrote nothing), so a `PreCompact` hook records compactions as the fallback signal for `orch context`. `/usage` is display-only, and the OAuth credentials in the keychain were deliberately not used: an undocumented endpoint and a token in a script are the wrong price for a number the CLI already prints.
+
+Headless workers that hit the window die with HTTP 429 and the text "You've hit your session limit · resets HH:MM"; `orch spawn` classifies that as `RATE_LIMITED` and prints the reset time. Interactive sessions on 2.1.234+ auto-continue at the reset if a limit interrupts them mid-turn; the manager relies on that for itself, never for workers.
 
 ## 7. Every exit is an outcome word
 
