@@ -1,6 +1,6 @@
 # Design notes
 
-These are the decisions behind claude-orch and the evidence for them. Most were made before the first real run; the last five came from reviewing a multi-day run of about a hundred workers across three manager sessions.
+These are the decisions behind claude-orch and the evidence for them. Most were made before the first real run; sections 6–10 came from reviewing a multi-day run of about a hundred workers across three manager sessions, and section 11 adds Grok as a second worker engine.
 
 ## 1. Headless CLI workers, interactive manager
 
@@ -53,6 +53,24 @@ The first run's curated-lessons file reached 1,246 lines because managers pasted
 ## 10. Verify-first and root-cause-first are enforced by the result format
 
 `result.md` must contain "Claims verified / falsified / unverified" and "Root cause" sections. The manager rejects results that skip them. In the first real run a meaningful fraction of stated facts were falsified by explore workers before anything was built on them, which is the whole point.
+
+## 11. Grok as a second worker engine
+
+Claude's 5-hour window is what stops long runs. A Grok subscription has only a weekly allowance, so Grok workers let decided implementation keep moving while Claude's window is tight, and use an allowance that otherwise expires unspent. Grok implements; facts, root causes, design and the review of shipped Grok work stay on Claude (manager skill, section 11).
+
+Everything below was measured on Grok CLI 1.0.70 with throwaway sessions in a scratch repository:
+
+- **Context window.** `grok-4.7` and `grok-4.7-build-fast` offer 256k and 500k (`contextWindows: [256000, 500000]`) and default to 256k. Headless `grok -p` has no flag for it, and a per-model override exists only in the user's global `config.toml`, which would change every Grok session on the machine. Over the agent protocol, `session/set_model` with `_meta.contextWindow: 500000` (and `reasoningEffort`) is accepted and stored with the session; `grok -p --resume <id>` keeps it, also when `-m` switches the model on resume. So `orch` opens each Grok session over the agent protocol and runs the worker as a headless resume.
+- **Rules.** `session/new` `_meta.rules` becomes part of the session's system prompt and persists across resumes; the worker protocol goes there.
+- **Project instructions.** A plain headless session in a trusted folder gets `CLAUDE.md` injected at its first prompt. A session opened over the agent protocol and then resumed headless does not: the model reported no project instructions. `orch` therefore embeds the instruction files itself: the project directory and every parent up to, not including, `$HOME`, outermost first, 10,000 characters per file, larger sets listed for the worker to read. That is also what a Claude worker sees, whereas Grok on its own reads only from the git root down. Folder trust (`grok --cwd <dir> --trust inspect`, no model call) is still recorded so project skills and settings load.
+- **Claude Code compatibility.** In a trusted folder Grok loads the user's Claude hooks, MCP servers and skills. A project `PreToolUse` hook fired in a Grok session by default and did not fire with `GROK_CLAUDE_HOOKS_ENABLED=0`; `GROK_CLAUDE_MCPS_ENABLED=0` likewise turns the MCP surface off. Workers run with both off. The user-level `PreCompact` hook `install.sh` adds would otherwise count a worker's compaction as the manager's.
+- **Shell shapes under `--permission-mode dontAsk`** (one session per shape): allowed when every part is allowed — pipes, `&&` chains, `cd <dir> && git …`, `git -C <dir> …`, `python3 - <<'PY'` heredocs; read-only commands, `mkdir` and `touch` run without any rule. A command that no rule allows — `cp`, `rm`, `curl`, `node`, `git commit` without a grant, output redirection, `VAR=x cmd`, `$(…)`, a `for` loop — **cancels the whole session** (`stopReason: cancelled`, tool text "User cancelled the execution for tool …"). A command that matches an explicit `--deny` rule fails with "Denied by permission policy" and the session continues. Hence the protocol's warning, `orch` reporting a cancel as `BLOCKED` with the command, and a deny list that turns the never-grantable commands into recoverable refusals.
+- **Rules syntax.** Grok accepts `Tool(glob)` rules for Bash, Read, Edit, Write, Grep, WebFetch and MCPTool. `orch` translates the Claude worker's allowlist and deny list (`Bash(x:*)` becomes `Bash(x)` and `Bash(x *)`), so both engines share one source; Claude-only tool names are dropped, and every denied git command also gets its `git -C * …` form because Grok runs that shape.
+- **Turn cap.** The stream carries `{"type":"max_turns_reached"}` and an `end` event with `stopReason: max_turn_requests`.
+- **Weekly allowance.** The agent-protocol extension `_x.ai/billing` (behind Grok's `/usage`) returns `creditUsagePercent` and the current `USAGE_PERIOD_TYPE_WEEKLY` period's start and end, in under a second and without a model call. `orch` reads it after every Grok worker and on `orch limits`, and turns used-versus-elapsed into the budget word. A rate-limit outcome also sets a latch, cleared by the next accepted run or a meter reading below 97%.
+- **Cost.** The stream's `end` event carries `total_cost_usd`, an API-equivalent figure; the subscription itself is billed against the weekly meter.
+
+End-to-end check on a scratch repository: Grok explore and build workers returned contract-complete results; the build worker fixed a bug, added tests in a new file, ran them, and committed with a pathspec under the commit-message rule from the embedded `CLAUDE.md`; a worker that ran an ungranted command came back `BLOCKED` with that command, was granted it through `allow.txt` in Claude syntax and resumed on `grok-4.7-build-fast` with its 500k window intact; a 2-turn cap came back `MAX_TURNS` and finished on resume; no Claude hook fired from any Grok worker; a Claude worker in the same run behaved as before.
 
 ## What was measured in the first real run
 

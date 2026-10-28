@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# orch — spawn and inspect headless Claude Code worker sessions.
+# orch — spawn and inspect headless worker sessions: Claude Code, or Grok (lib/grok_worker.py).
 # See README.md and docs/design.md. All state lives under <project>/orchestration/.
 set -euo pipefail
 
@@ -12,6 +12,9 @@ done
 TOOLKIT="$(cd "$(dirname "$SELF")/.." && pwd)"
 CLAUDE_BIN="${ORCH_CLAUDE_BIN:-$HOME/.local/bin/claude}"
 LIMITS_FILE="${ORCH_LIMITS_FILE:-$HOME/.claude/orch/limits.json}"
+GROK_BIN="${ORCH_GROK_BIN:-grok}"
+GROK_LIB="$TOOLKIT/lib/grok_worker.py"
+GROK_LIMITS_FILE="${ORCH_GROK_LIMITS_FILE:-$(dirname "$LIMITS_FILE")/grok_limits.json}"
 
 usage() {
   cat <<USAGE
@@ -19,11 +22,18 @@ usage:
   orch init    --project <dir>
   orch spawn   --project <dir> --id <id> --role explore|build --model <model> --manager <session-name>
                [--prompt-file <file>] [--max-turns N] [--allow "<Tool(rule)>"]... [--resume] [--note "<text>"]
+               [--engine claude|grok] [--effort low|medium|high|xhigh] [--context 256k|500k]
+               (a grok-* model runs the worker on the Grok CLI; --effort and --context are grok-only,
+                default high and 500k; the window is fixed at a worker's first spawn)
   orch status  --project <dir>
   orch report  --project <dir>          run analytics per phase: cost, turns, turn-cap rate, limit hits, denials by shape (markdown)
   orch brief   --project <dir>          compact start-of-session briefing for a manager
-  orch limits [--refresh]               5h/7d usage from the last worker run or statusline; --refresh runs a 1-turn haiku probe (exit 2 if 5h >= 85%)
+  orch limits [--refresh] [--engine claude|grok]
+                                        claude 5h/7d usage from the last worker run or statusline (exit 2 if 5h >= 85%)
+                                        and the grok weekly meter with a budget word; --refresh runs a 1-turn haiku
+                                        probe and re-reads the grok meter (no grok model call)
   orch context --project <dir>          context % (terminal statusline) or compaction count (IDE extension) of the newest session in <dir>
+  orch doctor                           check the claude and grok CLIs, grok flags, grok login and weekly meter
   orch ended   --project <dir> --id <id>  (used by the SessionEnd hook)
 
 spawn blocks until the worker exits. Run it in the background from the manager so the
@@ -38,6 +48,7 @@ USAGE
 CMD="$1"; shift
 
 PROJECT=""; ID=""; ROLE=""; MODEL=""; MANAGER=""; PROMPT_FILE=""; MAX_TURNS=""; RESUME=0; NOTE=""; REFRESH=0
+ENGINE=""; EFFORT=""; CONTEXT=""
 EXTRA_ALLOW=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,12 +63,15 @@ while [ $# -gt 0 ]; do
     --resume) RESUME=1; shift;;
     --note) NOTE="$2"; shift 2;;
     --refresh) REFRESH=1; shift;;
+    --engine) ENGINE="$2"; shift 2;;
+    --effort) EFFORT="$2"; shift 2;;
+    --context) CONTEXT="$2"; shift 2;;
     -h|--help) usage;;
     *) echo "unknown arg: $1" >&2; usage;;
   esac
 done
 
-if [ "$CMD" != limits ]; then
+if [ "$CMD" != limits ] && [ "$CMD" != doctor ]; then
   [ -n "$PROJECT" ] || { echo "--project required" >&2; usage; }
   PROJECT="$(cd "$PROJECT" && pwd)"
   ORCH="$PROJECT/orchestration"
@@ -122,6 +136,18 @@ print(f"EXITED_NO_RESULT\t{txt[:120]} | {info}")
 PY
 }
 
+# A grok run.json carries "engine": "grok" and is classified by lib/grok_worker.py.
+classify_any() { # $1 run.json  $2 result.md
+  if grep -q '"engine": "grok"' "$1" 2>/dev/null; then python3 "$GROK_LIB" classify "$1" "$2"
+  else classify_run "$1" "$2"; fi
+}
+
+engine_of() { # $1 worker dir -> engine of its latest spawn (spawns logged before engines existed are claude)
+  local e
+  e="$(grep -o ' engine=[a-z]*' "$1/spawns.log" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+  echo "${e:-claude}"
+}
+
 # ---------------------------------------------------------------- commands
 cmd_init() {
   mkdir -p "$ORCH/workers" "$ORCH/archive"
@@ -138,12 +164,12 @@ cmd_ended() {
 }
 
 cmd_status() {
-  printf "%-34s %-14s %-8s %-6s %s\n" WORKER STATUS COST TURNS SESSION
+  printf "%-34s %-7s %-16s %-8s %-6s %s\n" WORKER ENGINE STATUS COST TURNS SESSION
   for d in "$ORCH"/workers/*/; do
     [ -d "$d" ] || continue
     id="$(basename "$d")"
     if [ -s "$d/run.json" ]; then
-      status="$(classify_run "$d/run.json" "$d/result.md" | cut -f1)"
+      status="$(classify_any "$d/run.json" "$d/result.md" | cut -f1)"
     elif [ -f "$d/result.md" ]; then status="$(head -1 "$d/result.md" | sed -E 's/^[A-Za-z]+: *//')"
     elif [ -f "$d/ended" ]; then status="EXITED_NO_RESULT"
     elif [ -f "$d/started" ]; then status="RUNNING"
@@ -163,11 +189,33 @@ print(f"{cost:.3f}", turns, sess)
 PY
 )
     fi
-    printf "%-34s %-14s %-8s %-6s %s\n" "$id" "$status" "$cost" "$turns" "$sess"
+    printf "%-34s %-7s %-16s %-8s %-6s %s\n" "$id" "$(engine_of "$d")" "$status" "$cost" "$turns" "$sess"
   done
 }
 
+# Exit status is the claude part's (2 at >= 85% of the 5-hour window); the grok line never changes it.
 cmd_limits() {
+  local rc=0
+  case "${ENGINE:-both}" in
+    claude) claude_limits; return;;
+    grok) grok_limits; return;;
+    both) ;;
+    *) echo "--engine must be claude or grok" >&2; return 1;;
+  esac
+  claude_limits || rc=$?
+  grok_limits || true
+  return "$rc"
+}
+
+grok_limits() {
+  command -v "$GROK_BIN" >/dev/null 2>&1 || { echo "grok: not installed"; return 0; }
+  # Reading the meter costs no model call; re-read it when asked or when it is older than 30 minutes.
+  if [ "$REFRESH" = 1 ]; then python3 "$GROK_LIB" billing "$GROK_LIMITS_FILE" || true
+  else python3 "$GROK_LIB" billing "$GROK_LIMITS_FILE" 1800 || true; fi
+  python3 "$GROK_LIB" limits "$GROK_LIMITS_FILE"
+}
+
+claude_limits() {
   if [ "$REFRESH" = 1 ]; then
     # One-turn haiku probe (~1 cent). Its stream carries a rate_limit_event with current utilisation.
     PD="$(mktemp -d)"
@@ -178,7 +226,7 @@ cmd_limits() {
     rm -rf "$PD"
   fi
   if [ ! -f "$LIMITS_FILE" ]; then
-    echo "no limits data yet. Run: orch limits --refresh   (any worker run also records it)"; exit 3
+    echo "claude: no limits data yet. Run: orch limits --refresh   (any claude worker run also records it)"; return 3
   fi
   python3 - "$LIMITS_FILE" <<'PY'
 import json,sys,time,datetime
@@ -196,7 +244,7 @@ def fmt(name):
         except Exception: when=f" resets_at={ra}"
     return f"{name}: used={used}%{when}"
 stale=" (STALE: run 'orch limits --refresh')" if age>1800 else ""
-print(f"as_of={age//60}m ago via {j.get('_source','statusline')}{stale}  " + "  ".join(fmt(n) for n in ('five_hour','seven_day')))
+print(f"claude: as_of={age//60}m ago via {j.get('_source','statusline')}{stale}  " + "  ".join(fmt(n) for n in ('five_hour','seven_day')))
 if rl.get('five_hour',{}).get('used_percentage',0) is not None and rl.get('five_hour',{}).get('used_percentage',0)>=85: sys.exit(2)
 PY
 }
@@ -207,6 +255,7 @@ import json,glob,os,re,sys,collections
 orch=sys.argv[1]
 ph=collections.defaultdict(lambda: dict(units=0,sessions=0,cost=0.0,turns=0,max_turns=0,rate_limited=0,api_error=0,denials=0,no_result=0,oversize=0,models=collections.Counter(),statuses=collections.Counter()))
 shape=collections.Counter(); shape_ex={}
+eng=collections.defaultdict(lambda: dict(sessions=0,turns=0,cost=0.0,max_turns=0,rate_limited=0,cancelled=0))
 def classify(c):
     if re.match(r'^\s*[A-Za-z_][A-Za-z0-9_]*=\S',c): return 'env-prefix'
     if re.match(r'^\s*(for|while)\s',c): return 'shell-loop'
@@ -223,8 +272,13 @@ for d in sorted(glob.glob(os.path.join(orch,'workers','*/'))):
         except Exception: continue
         P['sessions']+=1; P['cost']+=j.get('total_cost_usd',0) or 0; P['turns']+=j.get('num_turns',0) or 0
         t=j.get('terminal_reason'); txt=str(j.get('result',''))
+        rl=bool(j.get('is_error') and (j.get('api_error_status')==429 or re.search(r'session limit|usage limit|rate.?limit|too many requests',str(j.get('error_message') or txt),re.I)))
+        E=eng[j.get('engine','claude')]; E['sessions']+=1; E['turns']+=j.get('num_turns',0) or 0; E['cost']+=j.get('total_cost_usd',0) or 0
+        if t=='max_turns': E['max_turns']+=1
+        if t=='permission_cancelled': E['cancelled']+=1
+        if rl: E['rate_limited']+=1
         if t=='max_turns': P['max_turns']+=1
-        if j.get('is_error') and (j.get('api_error_status')==429 or re.search(r'session limit|usage limit',txt,re.I)): P['rate_limited']+=1
+        if rl: P['rate_limited']+=1
         elif j.get('is_error') and t=='api_error': P['api_error']+=1
         for x in j.get('permission_denials',[]):
             P['denials']+=1
@@ -254,6 +308,11 @@ for k in sorted(ph,key=key):
 print(f"| **all** | {T['units']} | {T['sessions']} | {T['cost']:.2f} | {T['turns']} | {T['max_turns']} | {T['rate_limited']} | {T['api_error']} | {T['denials']} | {T['no_result']} | {T['oversize']} | |")
 if T['sessions']:
     print(f"\nSessions per unit: {T['sessions']/max(T['units'],1):.2f} · avg cost per session: ${T['cost']/T['sessions']:.2f} · turn-cap rate: {100*T['max_turns']/T['sessions']:.0f}% of sessions")
+if 'grok' in eng:
+    print("\n### By engine (grok cost is xAI's API-equivalent figure; the plan is billed against a weekly allowance, see `orch limits`)\n")
+    print("| engine | sessions | turns | cost usd | turn-cap exits | rate-limited | cancelled by allowlist |"); print("|---|---|---|---|---|---|---|")
+    for k in sorted(eng):
+        E=eng[k]; print(f"| {k} | {E['sessions']} | {E['turns']} | {E['cost']:.2f} | {E['max_turns']} | {E['rate_limited']} | {E['cancelled']} |")
 if shape:
     print("\n### Denials by command shape (what to fix: allow-list gaps vs prompt wording)\n")
     print("| shape | count | example |"); print("|---|---|---|")
@@ -308,21 +367,129 @@ cmd_brief() {
   echo "--- friction.md (curated rules) is $(wc -l < "$ORCH/friction.md" 2>/dev/null || echo 0) lines; plan.md $(wc -l < "$ORCH/plan.md" 2>/dev/null || echo 0); progress.md $(wc -l < "$ORCH/progress.md" 2>/dev/null || echo 0)"
 }
 
+cmd_doctor() {
+  local rc=0 help flag
+  echo "toolkit: $TOOLKIT"
+  if [ -x "$CLAUDE_BIN" ]; then echo "claude: $("$CLAUDE_BIN" --version 2>&1 | head -1)  ($CLAUDE_BIN)"
+  else echo "claude: MISSING at $CLAUDE_BIN (set ORCH_CLAUDE_BIN)"; rc=1; fi
+  if ! command -v "$GROK_BIN" >/dev/null 2>&1; then echo "grok: not installed (optional; set ORCH_GROK_BIN)"; exit "$rc"; fi
+  echo "grok: $("$GROK_BIN" --version 2>&1 | head -1)  ($(command -v "$GROK_BIN"))"
+  help="$("$GROK_BIN" --help 2>&1 || true)"
+  for flag in --prompt-file --resume --output-format --permission-mode --no-subagents --max-turns --allow --deny --effort --cwd; do
+    case "$help" in *"$flag"*) ;; *) echo "  MISSING flag $flag"; rc=1;; esac
+  done
+  case "$help" in *streaming-json*) echo "  headless flags: ok";; *) echo "  MISSING output format streaming-json"; rc=1;; esac
+  echo "  models: $("$GROK_BIN" models 2>/dev/null | sed -nE 's/^ +[*-] ([^ ]+).*/\1/p' | tr '\n' ' ')"
+  if python3 "$GROK_LIB" billing "$GROK_LIMITS_FILE"; then python3 "$GROK_LIB" limits "$GROK_LIMITS_FILE" | sed 's/^/  /' || true
+  else echo "  weekly meter: UNAVAILABLE (logged in? run: grok login)"; rc=1; fi
+  exit "$rc"
+}
+
+# ---------------------------------------------------------------- grok engine
+# A grok worker runs `grok -p --resume <session>` on a session lib/grok_worker.py opened over ACP with the
+# protocol as the session's rules and the model, context window and effort set (headless grok has no flag
+# for the window). The rest mirrors the claude path: same prompt.md, result.md and FINISHED line.
+spawn_grok() {
+  command -v "$GROK_BIN" >/dev/null 2>&1 || { echo "grok not found (install the Grok CLI or set ORCH_GROK_BIN)" >&2; exit 1; }
+  case "${CONTEXT:-500k}" in 256k|500k) ;; *) echo "--context must be 256k or 500k" >&2; exit 1;; esac
+  case "$EFFORT" in ""|low|medium|high|xhigh) ;; *) echo "--effort must be low, medium, high or xhigh" >&2; exit 1;; esac
+  if [ "$RESUME" = 1 ]; then
+    [ -f "$WDIR/session_id" ] || { echo "no grok session to resume for $ID" >&2; exit 1; }
+  elif [ -f "$WDIR/session_id" ]; then
+    echo "worker $ID already has a grok session; resume it with --resume or pick a new id" >&2; exit 1
+  fi
+  # Grok's Claude Code compatibility layer would start the user's Claude MCP servers and run Claude hooks
+  # (the PreCompact hook would count a worker's compaction as the manager's). Workers get neither.
+  export GROK_CLAUDE_MCPS_ENABLED="${ORCH_GROK_CLAUDE_MCPS:-0}" GROK_CLAUDE_HOOKS_ENABLED="${ORCH_GROK_CLAUDE_HOOKS:-0}"
+
+  local -a GALLOW=() GDENY=() ARGS=()
+  local rule SID WINDOW TS f RC CLS OUTCOME DETAIL PROMPT_PATH="$WDIR/.prompt.this-run.md"
+  while IFS= read -r rule; do GALLOW+=("$rule"); done < <(python3 "$GROK_LIB" translate "${ALLOW[@]}")
+  while IFS= read -r rule; do GDENY+=("$rule"); done < <(python3 "$GROK_LIB" deny "$TOOLKIT/settings/worker_settings.json")
+
+  if [ "$RESUME" = 1 ]; then
+    SID="$(cat "$WDIR/session_id")"; WINDOW="$(cat "$WDIR/context_window")"
+    if [ -n "$CONTEXT" ] && [ "$CONTEXT" != "$WINDOW" ]; then echo "note: the window stays $WINDOW (set at the first spawn); --context ignored" >&2; fi
+    TS=$(date +%s)
+    for f in run.json stream.jsonl result.md; do
+      if [ -f "$WDIR/$f" ]; then mv "$WDIR/$f" "$WDIR/${f%%.*}.$TS.${f#*.}"; fi
+    done
+    if [ -n "$NOTE" ]; then
+      grep -q '^## Resume notes' "$WDIR/prompt.md" || printf '\n## Resume notes\n' >> "$WDIR/prompt.md"
+      printf -- '- %s: %s\n' "$(date -u +%Y-%m-%dT%H:%MZ)" "$NOTE" >> "$WDIR/prompt.md"
+    fi
+    printf '%s\n' "You were resumed by the manager. Read $REL_WDIR/prompt.md again; new permissions or answers are appended at the bottom under '## Resume notes'. Continue the task. You have $MAX_TURNS turns in this session; write result.md well before they run out." > "$PROMPT_PATH"
+  else
+    WINDOW="${CONTEXT:-500k}"; EFFORT="${EFFORT:-high}"
+    python3 "$GROK_LIB" render "$TOOLKIT/templates/worker_protocol.grok.md" "$WDIR/.system_prompt.md" \
+      "$PROJECT" "$ID" "$REL_WDIR" "$MANAGER" "$ROLE"
+    if ! SID="$(python3 "$GROK_LIB" boot "$PROJECT" "$MODEL" "$WINDOW" "$EFFORT" "$WDIR/.system_prompt.md" "$WDIR/boot.log")"; then
+      echo "WORKER $ID FINISHED  engine=grok  outcome=SCRIPT_ERROR  rc=1  session bootstrap failed; see $WDIR/boot.log"
+      echo "ACTION: run 'orch doctor' (grok login, flags, model ids), then spawn again."
+      exit 2
+    fi
+    printf '%s\n' "$SID" > "$WDIR/session_id"; printf '%s\n' "$WINDOW" > "$WDIR/context_window"
+    { cat "$WDIR/prompt.md"; printf '\n(Turn budget for this session: %s. Commit or save work early; write result.md with at least 5 turns to spare.)\n' "$MAX_TURNS"; } > "$PROMPT_PATH"
+  fi
+
+  echo "spawning $ID engine=grok role=$ROLE model=$MODEL window=$WINDOW effort=${EFFORT:-session} max_turns=$MAX_TURNS resume=$RESUME allow_extra=${#EXTRA_ALLOW[@]}" >&2
+  {
+    echo "## spawn $(date -u +%Y-%m-%dT%H:%M:%SZ) engine=grok role=$ROLE model=$MODEL window=$WINDOW effort=${EFFORT:-session} max_turns=$MAX_TURNS resume=$RESUME session=$SID"
+    printf '   allow:'; printf ' %q' "${GALLOW[@]}"; echo
+    [ -n "$NOTE" ] && echo "   note: $NOTE"
+  } >> "$WDIR/spawns.log"
+
+  ARGS=(--cwd "$PROJECT" --prompt-file "$PROMPT_PATH" -m "$MODEL" --resume "$SID" --output-format streaming-json
+        --permission-mode dontAsk --no-subagents --max-turns "$MAX_TURNS")
+  if [ -n "$EFFORT" ]; then ARGS+=(--effort "$EFFORT"); fi
+  for rule in "${GDENY[@]}"; do ARGS+=(--deny "$rule"); done
+  for rule in "${GALLOW[@]}"; do ARGS+=(--allow "$rule"); done
+
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$WDIR/started"; rm -f "$WDIR/ended"
+  set +e
+  ( cd "$PROJECT" && ORCH_WORKER_DIR="$WDIR" ORCH_TOOLKIT="$TOOLKIT" "$GROK_BIN" "${ARGS[@]}" \
+      > "$WDIR/stream.jsonl" 2> "$WDIR/stderr.log" )
+  RC=$?
+  set -e
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$WDIR/ended"
+  python3 "$GROK_LIB" harvest "$WDIR/stream.jsonl" "$WDIR/stderr.log" "$WDIR/run.json" "$MODEL"
+
+  CLS="$(python3 "$GROK_LIB" classify "$WDIR/run.json" "$WDIR/result.md")"
+  OUTCOME="${CLS%%	*}"; DETAIL="${CLS#*	}"
+  python3 "$GROK_LIB" latch "$GROK_LIMITS_FILE" "$OUTCOME" "worker-$ID" "$DETAIL" || true
+  python3 "$GROK_LIB" billing "$GROK_LIMITS_FILE" 2>/dev/null || true
+  echo "WORKER $ID FINISHED  engine=grok  outcome=$OUTCOME  rc=$RC  $DETAIL"
+  echo "result: $WDIR/result.md"
+  python3 "$GROK_LIB" limits "$GROK_LIMITS_FILE" | head -1 || true
+  case "$OUTCOME" in
+    RATE_LIMITED) echo "ACTION: grok allowance hit. Stop grok spawns (claude workers are unaffected); resume this one unchanged after the weekly reset, or reroute the unit to claude.";;
+    API_ERROR)    echo "ACTION: transient error; resume unchanged once.";;
+    BLOCKED)      case "$DETAIL" in "not allowed:"*) echo "ACTION: the allowlist cancelled the session. Add the rule to allow.txt (claude syntax is fine) if it is safe, then resume with --note.";; esac;;
+    MAX_TURNS)    echo "ACTION: resume with --max-turns 30 --note 'Out of turns. Commit what is done and write result.md now.'";;
+    INCOMPLETE)   echo "ACTION: resume with --max-turns 20 --note 'result.md does not follow the protocol (${DETAIL%% |*}). Rewrite it and stop.'";;
+    EXITED_NO_RESULT|SCRIPT_ERROR) echo "ACTION: inspect $WDIR/stderr.log and the tail of log.md, then resume.";;
+  esac
+  case "$OUTCOME" in DONE|BLOCKED|FAILED|PLAN_CHANGE) exit 0;; *) exit 2;; esac
+}
+
 cmd_spawn() {
   for v in ID ROLE MODEL MANAGER; do [ -n "${!v}" ] || { echo "--$(echo $v | tr A-Z a-z) required" >&2; usage; }; done
   case "$ROLE" in explore|build) ;; *) echo "role must be explore or build" >&2; exit 1;; esac
+  # Engine: --engine wins; otherwise a grok-* model means the grok engine.
+  [ -n "$ENGINE" ] || case "$MODEL" in grok-*) ENGINE=grok;; *) ENGINE=claude;; esac
+  case "$ENGINE" in
+    claude) case "$MODEL" in grok-*) echo "$MODEL is a grok model; drop --engine claude" >&2; exit 1;; esac
+            [ -z "$EFFORT$CONTEXT" ] || { echo "--effort and --context apply to grok workers only" >&2; exit 1; };;
+    grok)   case "$MODEL" in grok-*) ;; *) echo "the grok engine needs a grok-* model (list them: grok models)" >&2; exit 1;; esac;;
+    *)      echo "--engine must be claude or grok" >&2; exit 1;;
+  esac
   WDIR="$ORCH/workers/$ID"
   REL_WDIR="orchestration/workers/$ID"
   mkdir -p "$WDIR/scratch"
   if [ -n "$PROMPT_FILE" ]; then cp "$PROMPT_FILE" "$WDIR/prompt.md"; fi
   [ -f "$WDIR/prompt.md" ] || { echo "no prompt: give --prompt-file or write $WDIR/prompt.md" >&2; exit 1; }
 
-  # Compose the worker system prompt from the protocol template.
-  sed -e "s|{{WORKER_ID}}|$ID|g" -e "s|{{WORKER_DIR}}|$REL_WDIR|g" -e "s|{{PROJECT_ROOT}}|$PROJECT|g" \
-      -e "s|{{MANAGER_NAME}}|$MANAGER|g" -e "s|{{ROLE}}|$ROLE|g" \
-      "$TOOLKIT/templates/worker_protocol.md" > "$WDIR/.system_prompt.md"
-
-  # Tool allowlists per role. Workers may always write inside their own directory.
+  # Tool allowlists per role (claude syntax; spawn_grok translates them). Workers may always write inside their own directory.
   ALLOW=(Read Grep Glob WebFetch WebSearch SendMessage ListAgents
          "Write($REL_WDIR/**)" "Edit($REL_WDIR/**)"
          "Bash(ls:*)" "Bash(cat:*)" "Bash(head:*)" "Bash(tail:*)" "Bash(wc:*)" "Bash(find:*)" "Bash(grep:*)" "Bash(rg:*)"
@@ -341,6 +508,12 @@ cmd_spawn() {
   ALLOW+=("${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}")
 
   : "${MAX_TURNS:=$([ "$ROLE" = build ] && echo 60 || echo 40)}"
+  if [ "$ENGINE" = grok ]; then spawn_grok; fi
+
+  # Compose the worker system prompt from the protocol template.
+  sed -e "s|{{WORKER_ID}}|$ID|g" -e "s|{{WORKER_DIR}}|$REL_WDIR|g" -e "s|{{PROJECT_ROOT}}|$PROJECT|g" \
+      -e "s|{{MANAGER_NAME}}|$MANAGER|g" -e "s|{{ROLE}}|$ROLE|g" \
+      "$TOOLKIT/templates/worker_protocol.md" > "$WDIR/.system_prompt.md"
 
   RESUME_ARGS=()
   if [ "$RESUME" = 1 ]; then
@@ -364,7 +537,7 @@ cmd_spawn() {
 
   echo "spawning $ID role=$ROLE model=$MODEL max_turns=$MAX_TURNS resume=$RESUME allow_extra=${#EXTRA_ALLOW[@]}" >&2
   {
-    echo "## spawn $(date -u +%Y-%m-%dT%H:%M:%SZ) role=$ROLE model=$MODEL max_turns=$MAX_TURNS resume=$RESUME"
+    echo "## spawn $(date -u +%Y-%m-%dT%H:%M:%SZ) engine=claude role=$ROLE model=$MODEL max_turns=$MAX_TURNS resume=$RESUME"
     printf '   allow:'; printf ' %q' "${ALLOW[@]}"; echo
     [ -n "$NOTE" ] && echo "   note: $NOTE"
   } >> "$WDIR/spawns.log"
@@ -388,7 +561,7 @@ cmd_spawn() {
 
   CLS="$(classify_run "$WDIR/run.json" "$WDIR/result.md")"
   OUTCOME="${CLS%%	*}"; DETAIL="${CLS#*	}"
-  echo "WORKER $ID FINISHED  outcome=$OUTCOME  rc=$RC  $DETAIL"
+  echo "WORKER $ID FINISHED  engine=claude  outcome=$OUTCOME  rc=$RC  $DETAIL"
   echo "result: $WDIR/result.md"
   case "$OUTCOME" in
     RATE_LIMITED) echo "ACTION: wait for the reset, then resume unchanged: orch spawn ... --id $ID --resume";;
@@ -400,5 +573,6 @@ cmd_spawn() {
 }
 
 case "$CMD" in
-  init) cmd_init;; spawn) cmd_spawn;; status) cmd_status;; report) cmd_report;; brief) cmd_brief;; limits) cmd_limits;; context) cmd_context;; ended) cmd_ended;; *) usage;;
+  init) cmd_init;; spawn) cmd_spawn;; status) cmd_status;; report) cmd_report;; brief) cmd_brief;; limits) cmd_limits;; context) cmd_context;; ended) cmd_ended;;
+  doctor) cmd_doctor;; *) usage;;
 esac

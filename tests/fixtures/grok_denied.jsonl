@@ -1,0 +1,6 @@
+{"type": "text", "data": "I'll run `wc -l calc.py` once, unchanged."}
+{"type": "tool_call", "toolCallId": "call-c9011f7a-c235-4a9f-b18f-9355ffc36c1c-0", "title": "run_terminal_command", "status": "pending", "toolName": "run_terminal_command", "rawInput": {"command": "wc -l calc.py"}, "content": []}
+{"type": "tool_call_update", "toolCallId": "call-c9011f7a-c235-4a9f-b18f-9355ffc36c1c-0", "status": null, "content": [{"type": "content", "content": {"type": "text", "text": "Count lines in calc.py"}}]}
+{"type": "tool_call_update", "toolCallId": "call-c9011f7a-c235-4a9f-b18f-9355ffc36c1c-0", "status": "failed", "content": [{"type": "content", "content": {"type": "text", "text": "Tool `run_terminal_command` was not executed: Denied by permission policy: deny rule on bash matching \"wc*\""}}]}
+{"type": "text", "data": "REFUSED"}
+{"type": "end", "stopReason": "end_turn", "num_turns": 2, "total_cost_usd": 0.01437316, "sessionId": "00000000-0000-7000-8000-000000000001"}
