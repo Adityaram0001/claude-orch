@@ -12,6 +12,7 @@ The human who opened this session is the only human. They want to be interrupted
 ## 0. Orientation (always, first)
 1. If `orchestration/` does not exist: `orch init --project .`
 2. `orch brief --project .` — one command: usage limits, your context %, worker table, OPEN questions, the handoff. Then read `orchestration/progress.md`, `friction.md` (curated rules), and the current-phase section of `plan.md`. Do not read `archive/` unless pointed there.
+2a. If the project has a systems knowledge base (the CLAUDE.md line "Systems knowledge base: `<dir>`", or `mighty-ops/state.json`), read `<kb>/inbox/orch-manager.md` if it exists, before planning. It is the systems manager's brief for you. When you act on it, cite its brief id (B-…) in plan.md. Never edit or delete it; the skill archives it.
 3. If invoked with `resume`: you are a fresh manager. `handoff.md` says exactly what to do first. Do that. Do not re-plan what the previous manager decided unless a result since then falsified it.
 4. Find your session name: `ListAgents`; its first line names this session. Workers need it as `--manager <name>`.
 5. `orch limits` (run `orch limits --refresh` if it is stale or empty) before spawning anything (section 8).
@@ -20,6 +21,7 @@ The human who opened this session is the only human. They want to be interrupted
 ## 1. Planning a phase
 - Write/refresh `plan.md` Objective from the human's ask.
 - **Verify-first.** Phase 1 of any run is explore workers that verify the stated facts and find root causes. Build workers come only after their inputs are VERIFIED in a result.md. Never build on an UNVERIFIED or FALSIFIED claim.
+- **Critical decisions** (a re-plan, an architecture choice, anything that changes a system's contract or another system's assumptions): if the `mighty-ops-system-manager` skill is installed, ask it before writing the units: `/mighty-ops-system-manager decide: <question>; options: …; constraints: … | from: orch-manager <your session name>`. Prefer asking through an explore worker on **opus** (`--max-turns 25`; the worker is the reasoner, so it gets the strongest model) whose prompt is that one line plus "put the ≤30-line answer verbatim in result.md": the skill body and its reads then stay out of your context. Ask inline only for a single urgent decision while your context is still small. Record the answer in plan.md under `## Decisions`: `- <date> <question> → <decision> (DR-nnnn, <kb path>)`. If you override it, write `→ OVERRIDE: <what> — <reason>`. Answers marked PROVISIONAL or PROPOSED (needs human) are not final: batch the human question.
 - Units: one question, one root cause, or one bounded change with its tests. If the prompt would exceed ~40 lines, split it.
 - Series vs parallel: no data dependency → parallel. **Parallel build units must touch disjoint files** (one live owner per file; each unit gets its own new test file). Record `depends on` in the plan table.
 - **Model per worker** (your call; one-line reason in the plan table): `opus` for unfamiliar code, root-cause analysis, design, anything where a wrong conclusion poisons later work; `sonnet` for well-specified implementation, mechanical refactors, tests, docs, concrete verification; `haiku` only for trivial transforms.
@@ -62,6 +64,7 @@ Read **only** `orchestration/workers/<id>/result.md`.
 - **API_ERROR** — transient. Resume unchanged once. Twice → wait 10 minutes (CronCreate one-shot), then resume.
 - **FAILED** — read why; split, upgrade the model, or re-scope. Record in `plan.md` Re-plans. Never resubmit unchanged.
 - **PLAN_CHANGE** — the worker also messaged you. Stop spawning in that area, re-plan, record with date and reason, cancel dependent units not yet started.
+  If the re-plan changes a system's design or contract, make the section-1 `decide:` call first and cite its DR in the Re-plan entry.
 - **EXITED_NO_RESULT / SCRIPT_ERROR** — look at `stderr.log` and the last 20 lines of `log.md`. Usually resume as for MAX_TURNS.
 After **every** outcome: refresh `handoff.md` (RUNNING list, waiting-on-human list, next steps). It is cheap and it is what saves you from compaction and limits. If the project is a git repo, commit `orchestration/` after each event with a one-line message.
 
@@ -73,7 +76,9 @@ Workers cannot push, force-reset, delete recursively, or run shell network calls
 2. `plan.md`: move the completed phase's detail to `archive/plan_p<N>.md`; keep Objective, Verified starting facts, current phase, Re-plans.
 3. `friction.md`: it must still be ≤ ~80 curated lines. Move raw merges to `archive/friction_raw_p<N>.md`.
 4. Re-plan the next phase from what was actually verified. Write `handoff.md` fully.
+   If the next phase touches two or more systems, run `/mighty-ops-system-manager brief-next-manager` first and plan from its brief.
 5. Decide who runs the next phase using `orch context --project .` (section 9).
+   KB freshness, at most once per boundary: if the project has a systems knowledge base, run `python3 ~/.claude/skills/mighty-ops-system-manager/scripts/catchup.py --project . --dry-run` and read its `Status:` line. `up_to_date` or `behind` → nothing (small drift is healed inside `decide:`). `provisional-candidate` → spawn one explore worker (sonnet is enough for this mechanical sync, `--max-turns 40`) whose prompt is "invoke `/mighty-ops-system-manager catchup`; put its ≤20-line summary in result.md", and let it finish before the next phase's first `decide:`. Never run `catchup` inline.
 
 ## 8. Usage limits (the 5-hour and 7-day windows)
 `orch limits` shows the account's utilisation: `five_hour: used=63% resets_in=89m (14:10)`. The numbers come from the `rate_limit_event` every worker run emits (so they refresh for free whenever a worker exits), from `orch limits --refresh` (a one-turn Haiku probe, about a cent, 3 seconds), or from the statusline in terminal sessions. If the line says STALE or there is no data, run `orch limits --refresh`. Check at orientation, before each spawn batch, and whenever a worker comes back RATE_LIMITED.
