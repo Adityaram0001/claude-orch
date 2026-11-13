@@ -22,9 +22,11 @@ usage:
   orch init    --project <dir>
   orch spawn   --project <dir> --id <id> --role explore|build --model <model> --manager <session-name>
                [--prompt-file <file>] [--max-turns N] [--allow "<Tool(rule)>"]... [--resume] [--note "<text>"]
-               [--engine claude|grok] [--effort low|medium|high|xhigh] [--context 256k|500k]
-               (a grok-* model runs the worker on the Grok CLI; --effort and --context are grok-only,
-                default high and 500k; the window is fixed at a worker's first spawn)
+               [--engine claude|grok] [--effort low|medium|high|xhigh|max] [--context 256k|500k]
+               (claude models: opus, sonnet, haiku or a full model name; --effort is optional, without it
+                the worker runs at the CLI's own default, and a resume keeps the worker's last effort;
+                max is claude-only. A grok-* model runs the worker on the Grok CLI: effort defaults to
+                high, --context is grok-only, default 500k, fixed at a worker's first spawn)
   orch status  --project <dir>
   orch report  --project <dir>          run analytics per phase: cost, turns, turn-cap rate, limit hits, denials by shape (markdown)
   orch brief   --project <dir>          compact start-of-session briefing for a manager
@@ -289,7 +291,8 @@ for d in sorted(glob.glob(os.path.join(orch,'workers','*/'))):
     if os.path.exists(sl):
         for line in open(sl):
             mm=re.search(r'model=(\S+)',line)
-            if mm: P['models'][mm.group(1)]+=1
+            ee=re.search(r' effort=(\S+)',line)
+            if mm: P['models'][mm.group(1)+('/'+ee.group(1) if ee and ee.group(1) not in ('default','session') else '')]+=1
     r=d+'result.md'
     if os.path.exists(r):
         L=sum(1 for _ in open(r)); 
@@ -392,7 +395,7 @@ cmd_doctor() {
 spawn_grok() {
   command -v "$GROK_BIN" >/dev/null 2>&1 || { echo "grok not found (install the Grok CLI or set ORCH_GROK_BIN)" >&2; exit 1; }
   case "${CONTEXT:-500k}" in 256k|500k) ;; *) echo "--context must be 256k or 500k" >&2; exit 1;; esac
-  case "$EFFORT" in ""|low|medium|high|xhigh) ;; *) echo "--effort must be low, medium, high or xhigh" >&2; exit 1;; esac
+  case "$EFFORT" in ""|low|medium|high|xhigh) ;; *) echo "--effort for a grok worker must be low, medium, high or xhigh" >&2; exit 1;; esac
   if [ "$RESUME" = 1 ]; then
     [ -f "$WDIR/session_id" ] || { echo "no grok session to resume for $ID" >&2; exit 1; }
   elif [ -f "$WDIR/session_id" ]; then
@@ -479,7 +482,8 @@ cmd_spawn() {
   [ -n "$ENGINE" ] || case "$MODEL" in grok-*) ENGINE=grok;; *) ENGINE=claude;; esac
   case "$ENGINE" in
     claude) case "$MODEL" in grok-*) echo "$MODEL is a grok model; drop --engine claude" >&2; exit 1;; esac
-            [ -z "$EFFORT$CONTEXT" ] || { echo "--effort and --context apply to grok workers only" >&2; exit 1; };;
+            [ -z "$CONTEXT" ] || { echo "--context applies to grok workers only" >&2; exit 1; }
+            case "$EFFORT" in ""|low|medium|high|xhigh|max) ;; *) echo "--effort must be low, medium, high, xhigh or max" >&2; exit 1;; esac;;
     grok)   case "$MODEL" in grok-*) ;; *) echo "the grok engine needs a grok-* model (list them: grok models)" >&2; exit 1;; esac;;
     *)      echo "--engine must be claude or grok" >&2; exit 1;;
   esac
@@ -535,9 +539,14 @@ cmd_spawn() {
 (Turn budget for this session: $MAX_TURNS. Commit or save work early; write result.md with at least 5 turns to spare.)"
   fi
 
-  echo "spawning $ID role=$ROLE model=$MODEL max_turns=$MAX_TURNS resume=$RESUME allow_extra=${#EXTRA_ALLOW[@]}" >&2
+  # Effort: a resume without --effort keeps the worker's last one; none at all leaves the CLI's default.
+  if [ -z "$EFFORT" ] && [ "$RESUME" = 1 ] && [ -s "$WDIR/effort" ]; then EFFORT="$(cat "$WDIR/effort")"; fi
+  EFFORT_ARGS=()
+  if [ -n "$EFFORT" ]; then EFFORT_ARGS=(--effort "$EFFORT"); printf '%s\n' "$EFFORT" > "$WDIR/effort"; else rm -f "$WDIR/effort"; fi
+
+  echo "spawning $ID role=$ROLE model=$MODEL effort=${EFFORT:-default} max_turns=$MAX_TURNS resume=$RESUME allow_extra=${#EXTRA_ALLOW[@]}" >&2
   {
-    echo "## spawn $(date -u +%Y-%m-%dT%H:%M:%SZ) engine=claude role=$ROLE model=$MODEL max_turns=$MAX_TURNS resume=$RESUME"
+    echo "## spawn $(date -u +%Y-%m-%dT%H:%M:%SZ) engine=claude role=$ROLE model=$MODEL effort=${EFFORT:-default} max_turns=$MAX_TURNS resume=$RESUME"
     printf '   allow:'; printf ' %q' "${ALLOW[@]}"; echo
     [ -n "$NOTE" ] && echo "   note: $NOTE"
   } >> "$WDIR/spawns.log"
@@ -546,7 +555,7 @@ cmd_spawn() {
   set +e
   ( cd "$PROJECT" && ORCH_WORKER_DIR="$WDIR" ORCH_TOOLKIT="$TOOLKIT" \
     "$CLAUDE_BIN" -p \
-      --model "$MODEL" --name "worker-$ID" \
+      --model "$MODEL" --name "worker-$ID" "${EFFORT_ARGS[@]+"${EFFORT_ARGS[@]}"}" \
       --output-format stream-json --verbose --permission-mode dontAsk --permission-prompts none \
       --max-turns "$MAX_TURNS" \
       --settings "$TOOLKIT/settings/worker_settings.json" \

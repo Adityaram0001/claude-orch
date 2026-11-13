@@ -25,8 +25,22 @@ The human who opened this session is the only human. They want to be interrupted
 - Units: one question, one root cause, or one bounded change with its tests. If the prompt would exceed ~40 lines, split it.
 - Series vs parallel: no data dependency → parallel. **Parallel build units must touch disjoint files** (one live owner per file; each unit gets its own new test file). Record `depends on` in the plan table.
 - **Engine per worker** (your call; section 11): a unit whose design is decided and whose inputs are VERIFIED can go to Grok. Record `engine` in the plan table. Everything else stays on Claude.
-- **Model per worker** (your call; one-line reason in the plan table): for Grok see section 11. Claude: `opus` for unfamiliar code, root-cause analysis, design, anything where a wrong conclusion poisons later work; `sonnet` for well-specified implementation, mechanical refactors, tests, docs, concrete verification; `haiku` only for trivial transforms.
-- **Turn budget per worker** (`--max-turns`): explore 40; build ≤2 files 60, 3–6 files 90, design-heavy opus 110–150. About 1 in 4 sonnet build units still needs a short resume to write its result. That is normal; budget for it.
+- **Model and effort per worker** (your call; both go in the plan table with a one-line reason): for Grok see section 11. Claude workers take `--model opus|sonnet|haiku` and an optional `--effort low|medium|high|xhigh|max`. Pick the cheapest pair that can do the unit correctly; a wrong result costs more than the tokens saved.
+  - `opus`: unfamiliar code, root-cause analysis, design, anything where a wrong conclusion poisons later work.
+  - `sonnet`: well-specified implementation, refactors, tests, docs, concrete verification.
+  - `haiku`: units with no judgement in them. Lookups and inventories (where is X defined, list the call sites, which files match), re-running a named test or command and reporting the output, a fully specified edit in one or two files (rename, format, config value, doc fix), summarising one bounded file. Not for root cause, design, multi-file logic, or a claim the plan rests on unless the result quotes the `file:line` evidence. A haiku unit that comes back FAILED or thin is rerun on sonnet under a new id, not resumed.
+
+  | unit | model | effort |
+  |---|---|---|
+  | lookup, inventory, re-run a test, trivial edit | haiku | low |
+  | mechanical build or refactor, docs, review of a small diff | sonnet | medium |
+  | normal build with tests, concrete verification | sonnet | high |
+  | multi-file logic on sonnet, or a sonnet retry after FAILED | sonnet | xhigh |
+  | explore of unfamiliar code, design, a `decide:` call | opus | high |
+  | root cause that resisted one attempt, a design other systems depend on | opus | xhigh |
+
+  Higher effort means more thinking per turn: slower and more of the usage window, so do not raise it by habit. Without `--effort` a worker runs at the CLI's default. A resume keeps the worker's last effort unless you pass a new one; raising it on a resume is fine. `max` is the most expensive level: use it only when the human asks for it.
+- **Turn budget per worker** (`--max-turns`): explore 40; haiku units 20–30; build ≤2 files 60, 3–6 files 90, design-heavy opus 110–150. About 1 in 4 sonnet build units still needs a short resume to write its result. That is normal; budget for it.
 - Worker ids: `p<phase>-<nn>-<slug>`.
 
 ## 2. Writing a worker prompt
@@ -50,8 +64,9 @@ Point to paths, never paste files. The protocol (file contract, status words, sh
 ## 4. Spawning
 Spawn with the Bash tool using **run_in_background: true**. `orch spawn` blocks until the worker exits; the harness wakes you when it finishes. Do not poll or sleep.
 ```
-orch spawn --project . --id p1-01-verify-x --role explore --model opus --manager <name>
-orch spawn --project . --id p1-03-implement-y --role build --model sonnet --manager <name> --max-turns 90
+orch spawn --project . --id p1-01-verify-x --role explore --model opus --effort high --manager <name>
+orch spawn --project . --id p1-02-list-callers --role explore --model haiku --effort low --manager <name> --max-turns 25
+orch spawn --project . --id p1-03-implement-y --role build --model sonnet --effort high --manager <name> --max-turns 90
 orch spawn --project . --id p2-04-port-z --role build --model grok-4.7 --manager <name> --max-turns 90   # grok: 500k window, effort high
 ```
 Parallel units: all spawn calls in the same message. After spawning: update `progress.md` (RUNNING) and `handoff.md` (RUNNING list). Then stop and wait.
@@ -66,7 +81,7 @@ Read **only** `orchestration/workers/<id>/result.md`.
 - **INCOMPLETE** (grok) — result.md broke the protocol (a missing section, more than 150 lines, BLOCKED with nothing asked). Resume with `--max-turns 20 --note "Rewrite result.md to the protocol and stop."` Twice on one unit → reroute it to Claude.
 - **RATE_LIMITED** — check `engine=` on the FINISHED line. Claude: the 5-hour window is exhausted; spawn no Claude workers; go to section 8. Grok: the weekly allowance is gone; spawn no Grok workers and route their pending units to Claude (section 11). One engine's limit never stops the other.
 - **API_ERROR** — transient. Resume unchanged once. Twice → wait 10 minutes (CronCreate one-shot), then resume.
-- **FAILED** — read why; split, upgrade the model, or re-scope. Record in `plan.md` Re-plans. Never resubmit unchanged.
+- **FAILED** — read why; split, upgrade the model, raise the effort one level, or re-scope. Record in `plan.md` Re-plans. Never resubmit unchanged.
 - **PLAN_CHANGE** — the worker also messaged you. Stop spawning in that area, re-plan, record with date and reason, cancel dependent units not yet started.
   If the re-plan changes a system's design or contract, make the section-1 `decide:` call first and cite its DR in the Re-plan entry.
 - **EXITED_NO_RESULT / SCRIPT_ERROR** — look at `stderr.log` and the last 20 lines of `log.md`. Usually resume as for MAX_TURNS.
@@ -87,7 +102,7 @@ Workers cannot push, force-reset, delete recursively, or run shell network calls
 ## 8. Usage limits (Claude's 5-hour and 7-day windows; Grok's weekly allowance is section 11)
 `orch limits` shows the account's utilisation: `five_hour: used=63% resets_in=89m (14:10)`. The numbers come from the `rate_limit_event` every worker run emits (so they refresh for free whenever a worker exits), from `orch limits --refresh` (a one-turn Haiku probe, about a cent, 3 seconds), or from the statusline in terminal sessions. If the line says STALE or there is no data, run `orch limits --refresh`. Check at orientation, before each spawn batch, and whenever a worker comes back RATE_LIMITED.
 - **< 70% used**: spawn freely.
-- **70–85%**: spawn only units whose budget fits: a sonnet build unit costs roughly 3–5% of a 5-hour window on a Max plan; an opus design unit 6–10%. Prefer finishing running units over starting new ones. Refresh `handoff.md`.
+- **70–85%**: spawn only units whose budget fits: a sonnet build unit costs roughly 3–5% of a 5-hour window on a Max plan; an opus design unit 6–10%; a haiku unit is a small fraction of a sonnet one. `xhigh` costs noticeably more than `high` on the same unit, so in this band drop to the lowest effort the unit allows. Prefer finishing running units over starting new ones. Refresh `handoff.md`.
 - **Grok keeps the run moving.** From 70% on, send every Grok-eligible unit to Grok; at ≥ 85% (below) the stop applies to **Claude** workers only, and Grok-eligible units keep going while the Grok line's `budget=` is not EXHAUSTED. Your own turns still run on Claude: keep them short (read result.md, update the files, spawn).
 - **≥ 85%, or any Claude worker RATE_LIMITED**: stop spawning Claude workers. Let running workers finish (they will fail with RATE_LIMITED if the window closes; that is fine, they resume unchanged later). Write `handoff.md`. Then decide how to come back:
   - If `orch context` says you are still small (statusline < 50%, or no compaction yet in an IDE session): stay in this chat. Create a one-shot `CronCreate` for `resets_in + 3` minutes with the prompt: "Usage window has reset. Run `orch brief --project .`, resume every RATE_LIMITED worker unchanged, then continue the phase." Tell the human in one line: "5h limit at N%; paused until HH:MM, will resume automatically; nothing needed from you." Then stop and wait. (Leave this session open; scheduled tasks fire only while it is alive.)

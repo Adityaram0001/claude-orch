@@ -8,7 +8,7 @@
 
 ## Phases
 ### Phase 1 — <name>
-| worker id | role | model | why this model | depends on | status |
-|---|---|---|---|---|---|
+| worker id | role | model | effort | why this model and effort | depends on | status |
+|---|---|---|---|---|---|---|
 
 ## Re-plans (append, dated)

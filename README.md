@@ -40,7 +40,7 @@ then describe the task. The manager will:
 
 1. `orch init` the `orchestration/` directory.
 2. Plan a phase: explore workers first (verify facts, find root causes), build workers after.
-3. Spawn workers in the background with `orch spawn`, choosing a model and turn budget per unit.
+3. Spawn workers in the background with `orch spawn`, choosing a model (`opus`, `sonnet` or `haiku`), an effort level and a turn budget per unit.
 4. Wake up when each worker exits, read its `result.md`, and act on the outcome word.
 5. Ask you only when a worker is blocked on something only you can give, and ask everything pending at once.
 6. Refresh `handoff.md` after every event, archive completed phases, and tell you when to start a fresh manager with `/orch-manager resume`.
@@ -108,6 +108,20 @@ For the manager's own context, `orch context --project .` reports the statusline
 
 No two sessions ever write the same file.
 
+## Model and effort for Claude workers
+
+```
+orch spawn --project . --id p1-02-list-callers --role explore --model haiku --effort low --manager <name>
+orch spawn --project . --id p2-01-fix-parser --role build --model sonnet --effort high --manager <name>
+```
+
+| choice | options | default |
+|---|---|---|
+| `--model` | `opus`, `sonnet`, `haiku`, or a full model name | — (required) |
+| `--effort` | `low`, `medium`, `high`, `xhigh`, `max` | not passed; the worker runs at the Claude CLI's own default |
+
+The manager picks the pair per unit: `haiku` at `low` for lookups and trivial edits, `sonnet` at `medium` or `high` for builds, `opus` at `high` or `xhigh` for root cause and design. The effort is written to `spawns.log`, and a `--resume` without `--effort` keeps the worker's last one. `orch report` counts sessions per model and effort (`sonnet/high:4`). The rules the manager follows are in section 1 of the manager skill.
+
 ## Grok workers
 
 ```
@@ -120,7 +134,7 @@ A `grok-*` model runs the worker on the Grok CLI (`--engine grok|claude` makes i
 |---|---|---|
 | model | `grok-4.7`; `grok-4.7-build-fast` (faster, uses the weekly allowance twice as fast) | — |
 | `--context` | `256k`, `500k` (fixed at a worker's first spawn) | `500k` |
-| `--effort` | `low`, `medium`, `high`, `xhigh` | `high` |
+| `--effort` | `low`, `medium`, `high`, `xhigh` (no `max` on Grok) | `high` |
 
 What `orch` does for a Grok worker:
 - Opens the session over Grok's agent protocol first (`grok agent stdio`), because headless `grok -p` has no flag for the context window. That step sets the model, window and effort and installs `templates/worker_protocol.grok.md` as the session's rules; the worker then runs as `grok -p --resume <session>` and every later resume keeps those settings.
@@ -137,7 +151,7 @@ What `orch` does for a Grok worker:
 orch init    --project <dir>
 orch spawn   --project <dir> --id <id> --role explore|build --model <m> --manager <session-name>
              [--max-turns N] [--allow "<rule>"]... [--resume] [--note "<text>"] [--prompt-file <f>]
-             [--engine claude|grok] [--effort low|medium|high|xhigh] [--context 256k|500k]
+             [--engine claude|grok] [--effort low|medium|high|xhigh|max] [--context 256k|500k]
 orch status  --project <dir>
 orch brief   --project <dir>      # limits, context, workers, open questions, handoff — one read
 orch report  --project <dir>      # per-phase cost, turns, turn-cap rate, limit hits, denials by shape, per engine
