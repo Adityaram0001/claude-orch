@@ -17,6 +17,7 @@ Long single sessions get compacted repeatedly and lose nuance; they also stop de
 - Claude Code **2.1.259 or newer** on PATH (`claude --version`), logged in.
 - macOS or Linux, bash, python3.
 - Optional, for Grok workers: the Grok CLI (`grok`, tested with 1.0.70), logged in (`grok login`).
+- Optional, for long-lived system knowledge across runs: [mighty-ops](https://github.com/Adityaram0001/mighty-ops) (see [Systems knowledge base](#systems-knowledge-base-mighty-ops)).
 - A project directory (git optional but recommended).
 
 ## Install
@@ -144,6 +145,16 @@ What `orch` does for a Grok worker:
 - Classifies the run. On Grok a command outside the allowlist **cancels the session**; `orch` reports that as `BLOCKED` with the command. A `result.md` with a missing section, over 150 lines, or BLOCKED without an ask is `INCOMPLETE`.
 
 `orch limits` adds a Grok line from Grok's own weekly meter (the call behind Grok's `/usage`; no model call): weekly percent used, how much of the week has passed, the pace to the reset, and a budget word the manager routes on — `SURPLUS`, `ON_PACE`, `TIGHT`, `EXHAUSTED`. A Grok limit stops Grok spawns only and a Claude 5-hour limit stops Claude spawns only, so the run keeps moving on whichever engine has allowance. Section 11 of the manager skill holds the routing rules: Grok implements decided, specified units; facts, root causes, design and the review of shipped Grok work stay on Claude.
+
+## Systems knowledge base (mighty-ops)
+
+The manager plans from `orchestration/` alone, so system-level knowledge (how the parts fit, which contracts other parts rely on, which limits are known, why past decisions were made) is lost between runs. [mighty-ops](https://github.com/Adityaram0001/mighty-ops) is a companion skill that keeps that knowledge in a knowledge base inside the project and catches itself up from git history. When it is installed, the manager skill uses it automatically:
+
+- **Before planning**, it reads the brief that mighty-ops leaves in `mighty-ops/inbox/orch-manager.md` (system health, suggested units, binding decisions, limitations to repeat in worker prompts) and cites the brief id in `plan.md`.
+- **For critical decisions** (a re-plan, an architecture choice, a contract change), it asks `/mighty-ops-system-manager decide: …` through an explore worker and records the answer, or an explicit override, under `## Decisions` in `plan.md`.
+- **At phase boundaries**, it runs a catch-up in a worker when the knowledge base has fallen too far behind.
+
+Without mighty-ops installed, none of this runs and the manager works as described above.
 
 ## Commands
 
