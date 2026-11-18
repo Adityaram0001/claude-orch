@@ -12,6 +12,30 @@ Workers can also run on **Grok** (the Grok CLI with a SuperGrok plan). The manag
 
 Long single sessions get compacted repeatedly and lose nuance; they also stop dead when a usage window closes. Splitting work into bounded worker sessions with externalised state fixes both, but doing it by hand (open a terminal, paste a prompt, relay results) is the bottleneck. `claude-orch` automates the mechanical part and keeps two disciplines in the workers' contract: **verify the stated facts before building on them**, and **find the root cause before fixing**.
 
+## claude-orch or subagents?
+
+Claude Code can already fan work out to subagents inside one session. Both approaches give each unit a fresh context; they differ in what survives when the session does not.
+
+| Aspect | Subagents in one session | claude-orch (manager + headless workers) | Winner |
+|---|---|---|---|
+| Context | Every result lands in the parent's context, which eventually compacts | The manager reads only `result.md` and hands over to a fresh manager when full | claude-orch |
+| Long runs | Bounded by one session | Many short sessions; runs for hours or days | claude-orch |
+| State | Mostly in the parent's context | Plain markdown under `orchestration/`, readable by any session | claude-orch |
+| Cutoff and resume | If the parent session ends, the run ends | `orch spawn --resume` for a worker, `/orch-manager resume` for the manager | claude-orch |
+| Usage limits | A closed window stalls everything | Tracks 5-hour and 7-day usage, stops spawning at 85% and waits for the reset, can route units to Grok | claude-orch |
+| Structure | Ad hoc | Phases, explore before build, a fixed result contract and outcome words | claude-orch |
+| Permissions | Inherit the session's mode | Per-role allowlists and a deny list; workers return `BLOCKED` instead of waiting on a prompt | claude-orch |
+| Model and effort | Model per agent | Model, effort and turn budget per unit, logged | claude-orch (slight) |
+| Observability | The returned summary | Per-worker logs and costs, `orch report` | claude-orch |
+| Speed and overhead | Instant start | Each worker reloads CLAUDE.md and skills (a few cents) | subagents |
+| Setup | Built in | `./install.sh`; local machine only | subagents |
+| Interactivity | Results arrive in your conversation as they finish | You follow the run through `/orch-status` and batched questions | subagents |
+| Small fan-out (a few lookups or reads) | Cheap and immediate | Overkill | subagents |
+| Working tree | An agent can run in its own git worktree | Workers share one tree, so build units must own separate files | subagents |
+| Knowledge across runs | None by itself | None by itself; pair it with [mighty-ops](https://github.com/Adityaram0001/mighty-ops) | tie |
+
+Use subagents for work that finishes in one sitting. Use claude-orch when the work is long, has many units, will cross a usage window, or should keep going while you are away. The two combine: each claude-orch worker is an ordinary Claude Code session and can use subagents itself.
+
 ## Requirements
 
 - Claude Code **2.1.259 or newer** on PATH (`claude --version`), logged in.
